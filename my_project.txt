@@ -1,0 +1,2 @@
+- We need to set up an mpi cluster system consisting at least three physiscal machine
+My project i want is parallel dbscan algorithm using the disjoint-set datastrucutre

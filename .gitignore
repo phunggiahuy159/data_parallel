@@ -1,0 +1,29 @@
+# ---- Build artifacts ----
+*.o
+*.obj
+pdsdbscan
+pdsdbscan_seq
+/src/*.o
+
+# ---- Data & results (regenerated, can be large) ----
+data/*.bin
+results/
+benchmark/results/
+*.nc
+
+# ---- Python ----
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ---- Third-party reference source (paper's original code; not ours) ----
+# Keep locally for comparison, but don't commit it into our repo.
+parallel_dbscan/
+
+# ---- Editor / OS noise ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
