@@ -1,98 +1,108 @@
-# prompt.md — one-shot setup prompt for a teammate
+# Set up your cluster node with Claude — one-shot prompt
 
-Copy everything in the box below and paste it to your AI coding assistant
-(e.g. Claude Code) running on **your own Windows laptop**. Change the hostname
-to your assigned node (`node2` or `node3`) before sending.
+You have Claude (Claude Code). To build your Ubuntu VM, set up MPI, build this
+project, and verify it — all automatically — do this:
+
+1. **Clone this repo** on your Windows laptop and enter it:
+   ```bash
+   git clone https://github.com/phunggiahuy159/data_parallel.git
+   cd data_parallel
+   ```
+2. **Open Claude Code** in that folder.
+3. **Edit one line** in the prompt below — set your hostname (`node2` or `node3`).
+4. **Copy the whole box below and paste it to Claude.** Then just answer Claude
+   when it asks you to do a physical action (run an admin command, reboot, or
+   connect the iPhone hotspot).
 
 ---
 
 ```
-I'm one of 3-4 people building an MPI cluster for a parallel-computing course.
-We run a parallel DBSCAN project (PDSDBSCAN-D, Patwary et al. SC'12). A teammate
-already built node1 and verified it; please set up MY node the same way using
-VBoxManage so it's automated. I have Oracle VirtualBox installed on Windows.
+You are setting up MY node of a 3-machine MPI cluster for a parallel-computing
+course. This repo is already cloned in the current directory — it's a parallel
+DBSCAN project (PDSDBSCAN-D). FIRST read SETUP.md, README.md, and this prompt.md
+in this repo: SETUP.md has the full architecture and the hard-won gotchas from my
+teammate who already built node1. Then drive the ENTIRE setup on my Windows
+laptop end-to-end using VBoxManage. I have Oracle VirtualBox installed.
 
-=== THE CLUSTER ===
-- iPhone Personal Hotspot is the WiFi LAN. Each laptop runs exactly ONE Ubuntu
-  Server VM in VirtualBox with a BRIDGED ADAPTER (one VM per machine = course rule).
-- iPhone hotspot subnet is 172.20.10.0/28 (gateway .1).
-- Every node uses the SAME Linux user `mpiuser` (password mpipass123) with
-  passwordless sudo. MY hostname must be **node2** (or node3 — ask me which).
-- Target per VM: 2 vCPU, 4096 MB RAM, 20 GB disk, Ubuntu Server 24.04.x LTS.
+MY NODE HOSTNAME: node2          <-- change to node3 if that's my assignment
+Cluster user on every node: mpiuser  (password mpipass123, passwordless sudo)
+VM target: 2 vCPU (more if my CPU allows), 4096 MB RAM, 20 GB disk,
+           Ubuntu Server 24.04.x LTS.
+Repo to clone INSIDE the VM: https://github.com/phunggiahuy159/data_parallel.git
+           -> clone it to ~/para
 
-=== CRITICAL GOTCHAS MY TEAMMATE ALREADY HIT (do these, save ~1 hour) ===
-1) HYPER-V STEALS VT-X. If my laptop has WSL2 / Docker Desktop / Hyper-V /
-   "Core Isolation – Memory Integrity" on, VirtualBox drops to slow "NEM" mode
-   and the installed Ubuntu HANGS in initramfs ("Begin: Loading essential
-   drivers ...") when the VM has >1 vCPU.
-   - Check: `(Get-ComputerInfo -Property HyperVisorPresent).HyperVisorPresent`
-     and look for "NEM" vs "VT-x" in the VM's Logs\VBox.log.
-   - Fix: have me run `bcdedit /set hypervisorlaunchtype off` in an ADMIN
-     terminal, then REBOOT Windows. (Reverse later with `... auto`.)
-2) INSTALL OVER NAT, NOT BRIDGED. Bridged-over-WiFi during the OS install stalls
-   on package downloads. Use NIC = NAT for the install with a port-forward
-   host 127.0.0.1:2222 -> guest 22. Switch to Bridged only AFTER install.
-3) DO NOT install VirtualBox Guest Additions in the unattended install — the
-   compile hangs/slows it and MPI doesn't need them. Install only openssh-server.
-4) The live-installer runs its OWN sshd; `mpiuser` only exists after the install
-   finishes and the VM reboots. Wait for the reboot before logging in as mpiuser.
-
-=== STEPS ===
-A. Detect: VBoxManage.exe path, a drive with 30+ GB free (put everything under
-   <DRIVE>:\MPI), and my WiFi bridge name via `VBoxManage list bridgedifs`.
-B. Download Ubuntu Server 24.04.x live-server amd64 ISO to <DRIVE>:\MPI\iso.
-C. Create the VM (hostname node2/node3): 2 vCPU, 4096 MB, 20 GB on <DRIVE>,
-   SATA controller, NIC1 = NAT + portforward 2222->22.
-D. Do the Hyper-V check (gotcha #1); if needed, fix + reboot BEFORE installing.
-E. `VBoxManage unattended install` with a MINIMAL autoinstall (script-template):
-   ssh install-server true, packages [openssh-server], identity hostname=node2/3
-   username=mpiuser, passwordless sudo. Locale en_US, tz Etc/UTC. Start headless.
-F. Poll until the INSTALLED system's sshd answers as mpiuser (it self-reboots).
-   Install an SSH key into ~/.ssh/authorized_keys (Windows has no sshpass; use
-   SSH_ASKPASS_REQUIRE=force with a tiny askpass script that echoes the password).
-G. Install the toolchain in the VM:
-   `sudo apt-get install -y build-essential openmpi-bin libopenmpi-dev`.
-H. Single-node verify (still on NAT, oversubscribed):
-   clone our repo or have me copy it to ~/para, then
-   `cd ~/para && make && mpirun --oversubscribe -np 4 ./pdsdbscan --n 5000
-    --eps 0.5 --min-pts 5 --verify`  → expect "ARI score ≈ 1.0".
-I. Switch NIC to BRIDGED on my WiFi adapter (Promiscuous: Allow All). Have me
-   connect the laptop to the iPhone hotspot, then configure the bridged interface
-   for DHCP (netplan) and confirm `ping 172.20.10.1` works and the VM has a
-   172.20.10.x IP.
-J. Report back: hostname, the bridged 172.20.10.x IP, and the ARI from step H.
-
-Use absolute paths and VBoxManage. Monitor long installs with screenshots
+Work through the phases below. Verify each step before moving on, use absolute
+paths, prefer VBoxManage, and monitor long installs with screenshots
 (`VBoxManage controlvm <vm> screenshotpng`) and by polling the SSH banner on
-127.0.0.1:2222. Tell me clearly whenever you need me to do something physical
-(run an admin command, reboot, or connect the iPhone hotspot).
+127.0.0.1:2222. STOP and tell me clearly whenever you need a physical action.
+
+PHASE A — build my VM + verify the project (no teammates needed):
+ 1. Detect: VBoxManage.exe path, a drive with 30+ GB free (use <DRIVE>:\MPI), and
+    my WiFi bridge name (`VBoxManage list bridgedifs`).
+ 2. HYPER-V / VT-X CHECK (critical — SETUP.md §1). Run in PowerShell:
+    (Get-ComputerInfo -Property HyperVisorPresent).HyperVisorPresent
+    If True (WSL2/Docker/Hyper-V/Core-Isolation is on), Windows is holding VT-x
+    and VirtualBox will run in slow "NEM" mode → the installed Ubuntu HANGS in
+    initramfs ("Begin: Loading essential drivers ...") whenever the VM has >1
+    vCPU. Fix: have me run `bcdedit /set hypervisorlaunchtype off` in an ADMIN
+    terminal, then REBOOT Windows, before continuing. (If False, skip.)
+ 3. Download the Ubuntu Server 24.04.x live-server amd64 ISO to <DRIVE>:\MPI\iso.
+ 4. Create the VM (hostname = my node). Set NIC1 = NAT with a port-forward
+    host 127.0.0.1:2222 -> guest 22, and INSTALL OVER NAT — bridged-during-install
+    stalls on package downloads. Do an unattended/minimal autoinstall that sets
+    user mpiuser + passwordless sudo, hostname = my node, and installs ONLY
+    openssh-server. DO NOT install VirtualBox Guest Additions (the compile
+    hangs/slows the install and MPI doesn't need them). Start headless. NOTE: the
+    live-installer runs its OWN sshd — mpiuser only exists AFTER the install
+    finishes and the VM reboots, so wait for that reboot.
+ 5. SSH into the installed system (Windows has no sshpass — use
+    SSH_ASKPASS_REQUIRE=force with a tiny askpass script that echoes the password,
+    or install an SSH key). Then inside the VM install the toolchain:
+    sudo apt-get update && sudo apt-get install -y git build-essential openmpi-bin libopenmpi-dev
+ 6. Clone + build the project inside the VM:
+    git clone https://github.com/phunggiahuy159/data_parallel.git ~/para
+    cd ~/para && make
+ 7. Self-test on my single VM (still on NAT, oversubscribed):
+    mpirun --oversubscribe -np 4 ./pdsdbscan --n 5000 --eps 0.5 --min-pts 5 --verify
+    Confirm the output shows "ARI score" ~ 1.0, and report it to me.
+    (If ARI is ~0, the build is stale/broken — rebuild and re-run.)
+
+PHASE B — join the cluster (do this when my team meets, all on the iPhone hotspot):
+ 8. Tell me to turn the iPhone Personal Hotspot ON (Allow Others to Join: ON,
+    Maximize Compatibility: ON, screen on/plugged in) and connect my laptop WiFi
+    to it.
+ 9. Power off the VM, switch NIC1 to Bridged Adapter on my WiFi adapter
+    (Promiscuous Mode: Allow All), and boot it.
+10. Configure the VM's bridged interface for DHCP (netplan), then confirm:
+    `ip -4 addr` shows a 172.20.10.x address, and `ping -c2 172.20.10.1`
+    (the iPhone gateway) succeeds.
+11. Give me my hostname + 172.20.10.x IP so I can send it to the node1 (master)
+    owner, who will add it to /etc/hosts, set up passwordless SSH, and run the
+    cluster benchmark.
 ```
 
 ---
 
-## After everyone's node is up (run once, on node1 = master)
+## For the node1 owner (master) — after everyone reports their IP
 
-1. Make sure all laptops are on the **iPhone hotspot** and each VM has a
-   `172.20.10.x` IP (`ip -4 addr` inside each VM).
-2. On every node, put all three in `/etc/hosts`:
-   ```
-   172.20.10.2  node1
-   172.20.10.3  node2
-   172.20.10.4  node3
-   ```
-3. From node1, passwordless SSH to the others:
-   ```bash
-   ssh-keygen -t rsa -b 4096 -N "" -f ~/.ssh/id_rsa   # if needed
-   ssh-copy-id node2 && ssh-copy-id node3
-   ```
-4. Set slots to your core count in `cluster_setup/hosts.conf` (2 vCPU → `slots=2`).
-5. Deploy and run across all 3 machines:
-   ```bash
-   cd ~/para && make && make deploy
-   mpirun -np 6 --hostfile cluster_setup/hosts.conf \
-       ./pdsdbscan --n 20000 --eps 0.5 --min-pts 5 --verify --timing
-   ```
-   Expect the cluster count to match sequential and **`ARI ≈ 1.0`**.
+```bash
+# 1) On ALL nodes, put everyone in /etc/hosts (use the real 172.20.10.x IPs):
+#      172.20.10.2  node1
+#      172.20.10.3  node2
+#      172.20.10.4  node3
+# 2) From node1, set up passwordless SSH to the workers:
+ssh-keygen -t rsa -b 4096 -N "" -f ~/.ssh/id_rsa     # if not present
+ssh-copy-id node2 && ssh-copy-id node3
+ssh node2 hostname && ssh node3 hostname             # should print node2 / node3
+# 3) Set slots = vCPUs-per-VM in cluster_setup/hosts.conf, then build everywhere:
+cd ~/para && make && make deploy
+# 4) Smoke-test across all 3 machines (replace 6 with your total core count):
+mpirun -np 6 --hostfile cluster_setup/hosts.conf hostname
+mpirun -np 6 --hostfile cluster_setup/hosts.conf \
+    ./pdsdbscan --n 20000 --eps 0.5 --min-pts 5 --verify     # expect ARI ~ 1.0
+# 5) Full benchmark (charts for the report):
+bash benchmark/run_benchmark.sh
+```
 
-Full details (datasets, benchmark suite, flags, output format) are in
-[`README.md`](README.md); cluster bring-up details are in [`SETUP.md`](SETUP.md).
+See `SETUP.md` for cluster bring-up details and `README.md` for running, dataset
+generation, and the benchmark suite.

@@ -7,6 +7,11 @@ Implements the **PDSDBSCAN-D** algorithm from:
 
 Cluster target: **3 physical machines × 4 cores = 12 MPI processes**.
 
+> **🚀 New teammate setting up your node?** Clone this repo, open **Claude Code**
+> in the folder, and paste the one-shot prompt in [`prompt.md`](prompt.md) — it
+> builds your Ubuntu VM, installs MPI, builds this project, and verifies it
+> end-to-end. Cluster bring-up details are in [`SETUP.md`](SETUP.md).
+
 ---
 
 ## Repository Layout
