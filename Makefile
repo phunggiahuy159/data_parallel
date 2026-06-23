@@ -14,7 +14,13 @@
 
 CXX      := mpicxx
 CXX_SEQ  := g++
-CXXFLAGS := -O3 -std=c++17 -Wall -Wextra -Isrc
+
+# Source fingerprint (SHA1 of all parallel sources, 12 hex chars). The runtime
+# guard in main.cpp compares this across ranks and refuses to run a cluster of
+# mismatched binaries. .gitattributes enforces LF so the hash matches everywhere.
+BUILD_HASH := $(shell cat src/*.cpp src/*.hpp 2>/dev/null | sha1sum | cut -c1-12)
+
+CXXFLAGS := -O3 -std=c++17 -Wall -Wextra -Isrc -DBUILD_HASH=\"$(BUILD_HASH)\"
 LDFLAGS  :=
 
 TARGET     := pdsdbscan
@@ -41,6 +47,12 @@ $(TARGET): $(OBJS)
 src/%.o: src/%.cpp $(HDRS)
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
+# main.o always recompiles so the embedded BUILD_HASH stays current even when
+# only another translation unit changed.
+src/main.o: src/main.cpp $(HDRS) FORCE
+	$(CXX) $(CXXFLAGS) -c -o $@ $<
+FORCE:
+
 # ---- Sequential-only binary (for baseline timing) ---------------------------
 SEQ_SRCS := src/dbscan_seq.cpp
 SEQ_MAIN := tools/seq_main.cpp      # minimal wrapper, see below
@@ -64,7 +76,15 @@ deploy:
 	@echo "Built on all nodes."
 
 # ---- Clean ------------------------------------------------------------------
+# ---- Environment / version report (run on each node, compare the output) ----
+doctor:
+	@echo "host : $$(hostname)"
+	@echo "os   : $$(lsb_release -ds 2>/dev/null || uname -sr)"
+	@echo "g++  : $$(g++ --version | head -1)"
+	@echo "mpi  : $$(mpirun --version | head -1)"
+	@echo "build: $(BUILD_HASH)"
+
 clean:
 	rm -f $(OBJS) $(TARGET) $(TARGET_SEQ)
 
-.PHONY: all seq check deploy clean
+.PHONY: all seq check deploy clean doctor

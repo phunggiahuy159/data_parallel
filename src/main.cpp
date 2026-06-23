@@ -34,6 +34,12 @@
 #include <random>
 #include <unordered_map>
 
+// Source fingerprint, injected by the Makefile (-DBUILD_HASH). Lets every rank
+// prove it was built from identical source. Falls back to "dev" if unset.
+#ifndef BUILD_HASH
+#define BUILD_HASH "dev"
+#endif
+
 // ---------------------------------------------------------------------------
 // Argument parsing
 // ---------------------------------------------------------------------------
@@ -197,6 +203,40 @@ int main(int argc, char** argv) {
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    // --- Build-consistency guard --------------------------------------------
+    // Every rank carries a fingerprint of the source it was compiled from. If
+    // the nodes are running different binaries (the classic "a teammate has an
+    // old version" bug), detect it now and abort with a clear message instead
+    // of producing silently-wrong clustering results.
+    {
+        char my[16];
+        std::memset(my, 0, sizeof(my));
+        std::strncpy(my, BUILD_HASH, sizeof(my) - 1);
+        std::vector<char> all(static_cast<size_t>(size) * 16);
+        MPI_Gather(my, 16, MPI_CHAR,
+                   rank == 0 ? all.data() : nullptr, 16, MPI_CHAR,
+                   0, MPI_COMM_WORLD);
+        int bad = 0;
+        if (rank == 0) {
+            for (int r = 1; r < size; ++r)
+                if (std::memcmp(all.data(), all.data() + r*16, 16) != 0) { bad = 1; break; }
+            if (bad) {
+                std::fprintf(stderr,
+                    "\n*** BUILD MISMATCH — ranks are running DIFFERENT binaries ***\n");
+                for (int r = 0; r < size; ++r)
+                    std::fprintf(stderr, "    rank %2d : build %s\n", r, all.data() + r*16);
+                std::fprintf(stderr,
+                    "All nodes must run the SAME build. From the master node run\n"
+                    "`make deploy` (rebuilds identically everywhere), then re-run.\n\n");
+            }
+        }
+        MPI_Bcast(&bad, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        if (bad) { MPI_Finalize(); return 2; }
+        if (rank == 0)
+            std::printf("[rank 0] build %s — consistent across %d rank(s)\n",
+                        BUILD_HASH, size);
+    }
 
     Args a = parse_args(argc, argv);
 

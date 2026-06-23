@@ -1,0 +1,10 @@
+# Force LF line endings everywhere so source is byte-identical on every machine.
+# This keeps the BUILD_HASH fingerprint (Makefile + main.cpp guard) consistent
+# across nodes, and avoids CRLF compile surprises.
+* text=auto eol=lf
+
+# Treat these as binary (never line-ending-converted)
+*.bin  binary
+*.png  binary
+*.nc   binary
+*.pdf  binary
