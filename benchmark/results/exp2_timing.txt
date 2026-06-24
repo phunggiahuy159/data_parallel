@@ -1,0 +1,20 @@
+[rank 0] build 2e4ffbb17207 — consistent across 8 rank(s)
+[rank 0] Dataset: 10000 points, 2 dims
+[rank 0] eps=0.500  min_pts=5  procs=8
+
+=== PARALLEL RESULTS (PDSDBSCAN-D) ===
+  clusters    : 7
+  noise pts   : 57
+  wall time   : 92.2761 s
+  max compute : 0.0994 s
+  max comm    : 92.2293 s
+
+ rank   compute(s)    comm(s)
+    0       0.0459    92.2293
+    1       0.0473    92.0999
+    2       0.0198    92.0329
+    3       0.0426    91.9969
+    4       0.0681    92.0879
+    5       0.0748    92.0660
+    6       0.0994    92.0333
+    7       0.0614    92.0594
