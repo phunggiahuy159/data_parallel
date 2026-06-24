@@ -1,0 +1,2 @@
+n_procs,n_points,timing_file
+8,16384,/home/mpiuser/para/benchmark/results_pow2/exp2_timing.txt

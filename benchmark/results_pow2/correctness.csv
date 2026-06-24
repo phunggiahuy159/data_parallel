@@ -1,0 +1,5 @@
+n_points,procs,seq_clusters,par_clusters,ari
+2048,8,5,5,1.000000
+1.0
+4096,8,8,8,0.999557
+1.0

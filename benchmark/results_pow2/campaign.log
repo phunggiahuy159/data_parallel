@@ -1,0 +1,30 @@
+[14:14:10] === EXP1: runtime vs N (np=8, 4 machines) ===
+[14:14:14] exp1 N=1024 wall=2.1727 comp=0.0014 comm=2.1712
+[14:14:23] exp1 N=2048 wall=7.2008 comp=0.0052 comm=7.1953
+[14:14:39] exp1 N=4096 wall=14.5862 comp=0.0175 comm=14.5689
+[14:15:25] exp1 N=8192 wall=43.5879 comp=0.2043 comm=43.5076
+[14:17:32] exp1 N=16384 wall=125.0116 comp=0.2776 comm=124.7542
+[14:17:32] N_target=16384 (2^14)
+[14:17:32] === EXP2: granularity (np=8 N=16384 --timing) ===
+[14:19:55] exp2 saved
+[14:19:55] === EXP3: speedup (N=16384, procs 1 2 4 8 16) ===
+[14:19:57] exp3 np=1 N=16384 wall=0.5136 comp=0.5070 comm=0.0028
+[14:20:00] exp3 np=2 N=16384 wall=0.3696 comp=0.3580 comm=0.0960
+[14:20:33] exp3 np=4 N=16384 wall=31.6520 comp=0.2774 comm=31.3732
+[14:22:42] exp3 np=8 N=16384 wall=126.4412 comp=0.2474 comm=126.2283
+[14:28:22] exp3 np=16 N=16384 wall=337.7394 comp=0.4774 comm=337.5243
+[14:28:22] === correctness (ARI) ===
+[14:28:32] correctness N=2048 seq=5 par=5 ari=1.000000
+1.0
+[14:28:51] correctness N=4096 seq=8 par=8 ari=0.999557
+1.0
+[14:28:51] === PLOTS (split comm/compute) ===
+saved /home/mpiuser/para/benchmark/results_pow2/exp1_wall_vs_n.png
+saved /home/mpiuser/para/benchmark/results_pow2/exp1_compute_vs_n.png
+saved /home/mpiuser/para/benchmark/results_pow2/exp2_comm_per_rank.png
+saved /home/mpiuser/para/benchmark/results_pow2/exp2_compute_per_rank.png
+saved /home/mpiuser/para/benchmark/results_pow2/exp3_wall_vs_procs.png
+saved /home/mpiuser/para/benchmark/results_pow2/exp3_compute_vs_procs.png
+saved /home/mpiuser/para/benchmark/results_pow2/exp3_speedup.png
+all split plots done
+[14:28:54] === CAMPAIGN DONE ===

@@ -48,7 +48,7 @@ struct Args {
     int     d        = 2;
     double  eps      = 0.5;
     int     min_pts  = 5;
-    int     seed     = 42;
+    int     seed     = 2;
     int     n_clust  = 10;
     std::string input;
     std::string output;
