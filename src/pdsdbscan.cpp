@@ -2,16 +2,23 @@
  * PDSDBSCAN-D  (Algorithm 5, Patwary et al. SC'12)
  * Parallel DBSCAN with Union-Find on distributed memory.
  *
- * Four-phase structure:
- *   Phase 0: Sort + MPI_Bcast full dataset.
- *   Stage 1: Gather-Neighbors — each rank filters its remote points
- *            from the already-broadcast dataset using extended bounding box.
- *   Stage 2: Local Computation — DSDBSCAN on X_t ∪ X_t' (no communication).
- *            Local-local unions: immediate.
- *            Local-remote unions: deferred as (x_gid, y'_gid) pairs.
- *   Stage 3: Merging — gather deferred pairs + per-point metadata to rank 0,
- *            run global sparse Union-Find, MPI_Bcast the remapping.
- *   Phase 4: MPI_Gather final labels to rank 0, restore original order.
+ * Communication architecture (matches the reference parallel_mpi design):
+ *   Phase 0: Scatter — rank 0 Scatterv's DISJOINT contiguous chunks of the
+ *            dataset (NOT a full broadcast). Each rank holds only ~N/p points.
+ *   Phase 1: Geometric partition — recursive median bisection (tree topology,
+ *            Comm_split + pairwise Sendrecv) so each rank owns a spatially
+ *            compact region. Replaces the old "x-sort + Bcast-everything".
+ *   Phase 2: Distributed halo ("extra points") — Allgather only the per-rank
+ *            extended bounding boxes, then point-to-point Isend/Irecv of just
+ *            the boundary points that fall inside a neighbour's region.
+ *   Stage 3: Local Computation — DSDBSCAN on X_t ∪ X_t' (no communication).
+ *            Local-local unions immediate; local-remote deferred as gid pairs.
+ *   Stage 4: Merge — gather the SMALL boundary set (deferred pairs + per-point
+ *            metadata) to rank 0, run global sparse Union-Find, Bcast remap.
+ *   Phase 5: Gather (orig_id, label) to rank 0 and reconstruct.
+ *
+ * Versus the old version this removes the O(N·p) full broadcast and the
+ * O(N·p)-style funnel; only O(boundary) crosses the wire in the hot path.
  */
 
 #include "pdsdbscan.hpp"
@@ -20,6 +27,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <numeric>
@@ -32,13 +40,11 @@
 using Clock = std::chrono::steady_clock;
 using Dur   = std::chrono::duration<double>;
 
-static double now_s() { return Dur(Clock::now().time_since_epoch()).count(); }
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-// 1-D block range for this rank
+// 1-D block range for this rank (used only for the initial Scatterv chunks).
 static void block_range(int64_t N, int rank, int size,
                         int64_t& start, int64_t& end) {
     int64_t base = N / size, rem = N % size;
@@ -46,7 +52,10 @@ static void block_range(int64_t N, int rank, int size,
     end   = start + base + (rank < rem ? 1 : 0);
 }
 
-// Gather a variable-length array of int64_t from all ranks to rank 0
+// Is n a power of two (>=1)?
+static bool is_pow2(int n) { return n > 0 && (n & (n - 1)) == 0; }
+
+// Gather a variable-length array of int64_t from all ranks to rank 0.
 // Returns the concatenated data (only valid on rank 0).
 static std::vector<int64_t> gather_i64(
     const std::vector<int64_t>& local, int rank, int size, MPI_Comm comm)
@@ -72,55 +81,210 @@ static std::vector<int64_t> gather_i64(
 }
 
 // ---------------------------------------------------------------------------
-// Stage 1: Gather-Neighbors  (Section IV-B, paper)
+// Phase 1: Geometric recursive-median partition (tree topology)
 // ---------------------------------------------------------------------------
-// The full dataset is already available via the Phase-0 Bcast.
-// We simply filter from all_pts for remote points inside our extended bbox.
-static void gather_neighbors(
-    const std::vector<double>& all_pts, int64_t N_global, int d,
-    const std::vector<double>& local_pts, int64_t local_N,
-    int64_t start, int64_t end,
-    double eps,
-    std::vector<double>&  remote_pts,    // output
-    std::vector<int64_t>& remote_gids)   // output
+// Redistributes points so each rank owns a spatially compact region. Migrates
+// coordinates AND their original ids together. Requires size = power of two;
+// for non-power-of-two callers must fall back (see pdsdbscan_d).
+static void geometric_partition(std::vector<double>& P,
+                                std::vector<int64_t>& oid,
+                                int d, MPI_Comm comm)
 {
-    if (local_N == 0) return;
+    int rank, size;
+    MPI_Comm_rank(comm, &rank);
+    MPI_Comm_size(comm, &size);
+    if (size < 2) return;
 
-    // Compute extended bounding box of local partition
-    std::vector<double> ext_min(d,  std::numeric_limits<double>::max());
-    std::vector<double> ext_max(d, -std::numeric_limits<double>::max());
-    for (int64_t i = 0; i < local_N; ++i)
-        for (int k = 0; k < d; ++k) {
-            ext_min[k] = std::min(ext_min[k], local_pts[i*d+k]);
-            ext_max[k] = std::max(ext_max[k], local_pts[i*d+k]);
-        }
-    for (int k = 0; k < d; ++k) { ext_min[k] -= eps;  ext_max[k] += eps; }
+    int L = 0; { int s = size; while (s > 1) { s >>= 1; ++L; } }
 
-    // Scan all_pts, collect remote points inside extended bbox
-    for (int64_t gi = 0; gi < N_global; ++gi) {
-        if (gi >= start && gi < end) continue;  // skip own points
-        bool inside = true;
-        for (int k = 0; k < d && inside; ++k) {
-            double v = all_pts[gi*d+k];
-            inside = (v >= ext_min[k]) && (v <= ext_max[k]);
+    for (int level = 0; level < L; ++level) {
+        int group_size = size >> level;     // procs sharing this sub-region
+        int half       = group_size / 2;
+        int color      = rank / group_size; // which sub-region
+        int base       = color * group_size;
+        int subrank    = rank - base;
+
+        MPI_Comm sub;
+        MPI_Comm_split(comm, color, rank, &sub);
+
+        int64_t n_local = static_cast<int64_t>(oid.size());
+
+        // Region bounding box over this sub-communicator
+        std::vector<double> lmin(d,  std::numeric_limits<double>::max());
+        std::vector<double> lmax(d, -std::numeric_limits<double>::max());
+        for (int64_t i = 0; i < n_local; ++i)
+            for (int k = 0; k < d; ++k) {
+                double v = P[i*d+k];
+                lmin[k] = std::min(lmin[k], v);
+                lmax[k] = std::max(lmax[k], v);
+            }
+        std::vector<double> gmin(d), gmax(d);
+        MPI_Allreduce(lmin.data(), gmin.data(), d, MPI_DOUBLE, MPI_MIN, sub);
+        MPI_Allreduce(lmax.data(), gmax.data(), d, MPI_DOUBLE, MPI_MAX, sub);
+
+        // Split along the widest dimension
+        int dd = 0; double best = gmax[0] - gmin[0];
+        for (int k = 1; k < d; ++k) {
+            double w = gmax[k] - gmin[k];
+            if (w > best) { best = w; dd = k; }
         }
-        if (inside) {
-            for (int k = 0; k < d; ++k)
-                remote_pts.push_back(all_pts[gi*d+k]);
-            remote_gids.push_back(gi);
+
+        // Approximate group median = median of per-proc local medians
+        double lmed = std::numeric_limits<double>::quiet_NaN();
+        if (n_local > 0) {
+            std::vector<double> col(n_local);
+            for (int64_t i = 0; i < n_local; ++i) col[i] = P[i*d+dd];
+            std::nth_element(col.begin(), col.begin() + col.size()/2, col.end());
+            lmed = col[col.size()/2];
         }
+        std::vector<double> allmed(group_size);
+        MPI_Allgather(&lmed, 1, MPI_DOUBLE, allmed.data(), 1, MPI_DOUBLE, sub);
+        std::vector<double> valid;
+        for (double m : allmed) if (!std::isnan(m)) valid.push_back(m);
+        double median;
+        if (valid.empty()) median = 0.5 * (gmin[dd] + gmax[dd]);
+        else { std::nth_element(valid.begin(), valid.begin()+valid.size()/2, valid.end());
+               median = valid[valid.size()/2]; }
+
+        // Lower half keeps coord<=median; upper half keeps coord>median.
+        int  partner = (subrank < half) ? base + subrank + half
+                                        : base + subrank - half;
+        bool lower   = subrank < half;
+
+        std::vector<double>  keepP, sendP;
+        std::vector<int64_t> keepO, sendO;
+        for (int64_t i = 0; i < n_local; ++i) {
+            bool mine = lower ? (P[i*d+dd] <= median) : (P[i*d+dd] > median);
+            auto& dstP = mine ? keepP : sendP;
+            auto& dstO = mine ? keepO : sendO;
+            for (int k = 0; k < d; ++k) dstP.push_back(P[i*d+k]);
+            dstO.push_back(oid[i]);
+        }
+
+        int scount = static_cast<int>(sendO.size()), rcount = 0;
+        MPI_Sendrecv(&scount, 1, MPI_INT, partner, 10,
+                     &rcount, 1, MPI_INT, partner, 10, comm, MPI_STATUS_IGNORE);
+        std::vector<double>  recvP(static_cast<size_t>(rcount) * d);
+        std::vector<int64_t> recvO(rcount);
+        MPI_Sendrecv(sendP.data(), scount*d, MPI_DOUBLE, partner, 11,
+                     recvP.data(), rcount*d, MPI_DOUBLE, partner, 11,
+                     comm, MPI_STATUS_IGNORE);
+        MPI_Sendrecv(sendO.data(), scount, MPI_INT64_T, partner, 12,
+                     recvO.data(), rcount, MPI_INT64_T, partner, 12,
+                     comm, MPI_STATUS_IGNORE);
+
+        P = std::move(keepP);
+        oid = std::move(keepO);
+        for (int64_t i = 0; i < rcount; ++i) {
+            for (int k = 0; k < d; ++k) P.push_back(recvP[i*d+k]);
+            oid.push_back(recvO[i]);
+        }
+
+        MPI_Comm_free(&sub);
     }
 }
 
 // ---------------------------------------------------------------------------
-// Stage 2: Local Computation  (Algorithm 5, lines 2-16)
+// Phase 2: Distributed halo  ("get_extra_points", Section IV-B)
+// ---------------------------------------------------------------------------
+// Allgather only the extended bounding boxes, then point-to-point exchange of
+// the boundary points each neighbour needs. Outputs remote points + their gids.
+static void get_extra_points(const std::vector<double>& P,
+                             const std::vector<int64_t>& oid,
+                             int d, double eps, MPI_Comm comm,
+                             std::vector<double>&  outP,
+                             std::vector<int64_t>& outO)
+{
+    int rank, size;
+    MPI_Comm_rank(comm, &rank);
+    MPI_Comm_size(comm, &size);
+    int64_t n = static_cast<int64_t>(oid.size());
+
+    // Extended local bounding box
+    std::vector<double> mn(d,  std::numeric_limits<double>::max());
+    std::vector<double> mx(d, -std::numeric_limits<double>::max());
+    for (int64_t i = 0; i < n; ++i)
+        for (int k = 0; k < d; ++k) {
+            double v = P[i*d+k];
+            mn[k] = std::min(mn[k], v);
+            mx[k] = std::max(mx[k], v);
+        }
+    for (int k = 0; k < d; ++k) { mn[k] -= eps; mx[k] += eps; }
+
+    // Allgather boxes:  per rank [mn(d) , mx(d)]
+    std::vector<double> mybb(2*d);
+    for (int k = 0; k < d; ++k) { mybb[k] = mn[k]; mybb[d+k] = mx[k]; }
+    std::vector<double> allbb(static_cast<size_t>(size) * 2 * d);
+    MPI_Allgather(mybb.data(), 2*d, MPI_DOUBLE, allbb.data(), 2*d, MPI_DOUBLE, comm);
+
+    // Collect my points that fall inside each neighbour's extended box
+    std::vector<std::vector<double>>  sbufP(size);
+    std::vector<std::vector<int64_t>> sbufO(size);
+    for (int k = 0; k < size; ++k) {
+        if (k == rank) continue;
+        const double* kmn = &allbb[static_cast<size_t>(k)*2*d];
+        const double* kmx = &allbb[static_cast<size_t>(k)*2*d + d];
+        bool overlap = true;
+        for (int j = 0; j < d; ++j)
+            if (mx[j] < kmn[j] || mn[j] > kmx[j]) { overlap = false; break; }
+        if (!overlap) continue;
+        for (int64_t i = 0; i < n; ++i) {
+            bool inside = true;
+            for (int j = 0; j < d; ++j) {
+                double v = P[i*d+j];
+                if (v < kmn[j] || v > kmx[j]) { inside = false; break; }
+            }
+            if (inside) {
+                for (int j = 0; j < d; ++j) sbufP[k].push_back(P[i*d+j]);
+                sbufO[k].push_back(oid[i]);
+            }
+        }
+    }
+
+    // Exchange counts, then the points (non-blocking)
+    std::vector<int> ssz(size, 0), rsz(size, 0);
+    for (int k = 0; k < size; ++k) ssz[k] = static_cast<int>(sbufO[k].size());
+    MPI_Alltoall(ssz.data(), 1, MPI_INT, rsz.data(), 1, MPI_INT, comm);
+
+    std::vector<std::vector<double>>  rbufP(size);
+    std::vector<std::vector<int64_t>> rbufO(size);
+    std::vector<MPI_Request> reqs;
+    for (int k = 0; k < size; ++k) {
+        if (rsz[k] > 0) {
+            rbufP[k].resize(static_cast<size_t>(rsz[k]) * d);
+            rbufO[k].resize(rsz[k]);
+            MPI_Request r1, r2;
+            MPI_Irecv(rbufP[k].data(), rsz[k]*d, MPI_DOUBLE,  k, 21, comm, &r1);
+            MPI_Irecv(rbufO[k].data(), rsz[k],   MPI_INT64_T, k, 22, comm, &r2);
+            reqs.push_back(r1); reqs.push_back(r2);
+        }
+    }
+    for (int k = 0; k < size; ++k) {
+        if (ssz[k] > 0) {
+            MPI_Request r1, r2;
+            MPI_Isend(sbufP[k].data(), ssz[k]*d, MPI_DOUBLE,  k, 21, comm, &r1);
+            MPI_Isend(sbufO[k].data(), ssz[k],   MPI_INT64_T, k, 22, comm, &r2);
+            reqs.push_back(r1); reqs.push_back(r2);
+        }
+    }
+    if (!reqs.empty())
+        MPI_Waitall(static_cast<int>(reqs.size()), reqs.data(), MPI_STATUSES_IGNORE);
+
+    for (int k = 0; k < size; ++k)
+        for (int64_t i = 0; i < rsz[k]; ++i) {
+            for (int j = 0; j < d; ++j) outP.push_back(rbufP[k][i*d+j]);
+            outO.push_back(rbufO[k][i]);
+        }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3: Local Computation  (Algorithm 5, lines 2-16)  — UNCHANGED logic
 // ---------------------------------------------------------------------------
 struct LocalResult {
     std::vector<int64_t> labels;     // for local points only (-1 = noise)
-    std::vector<int>     is_core;    // [local_N] — 1 if core
-    std::vector<int>     in_cluster; // [local_N] — 1 if assigned
-    // Deferred UnionQuery pairs: (x_gid, y'_gid)
-    std::vector<int64_t> deferred;   // flat: [x0, y0, x1, y1, ...]
+    std::vector<int>     is_core;    // [local_N]
+    std::vector<int>     in_cluster; // [local_N]
+    std::vector<int64_t> deferred;   // flat: [x0, y0, x1, y1, ...]  (gid pairs)
     double t_compute;
 };
 
@@ -136,38 +300,26 @@ static LocalResult local_computation(
     LocalResult res;
     res.labels.assign(local_N, -1);
 
-    if (local_N == 0 || total_N == 0) {
-        res.t_compute = 0.0;
-        return res;
-    }
+    if (local_N == 0 || total_N == 0) { res.t_compute = 0.0; return res; }
 
-    // Build KD-tree on (local ∪ remote)
     KDTree tree(all_pts.data(), static_cast<int>(total_N), d);
 
-    // Find neighbours for ALL points (needed for core-point determination)
     std::vector<std::vector<int>> nbrs(total_N);
     std::vector<bool> is_core_v(total_N, false);
     for (int64_t i = 0; i < total_N; ++i) {
-        nbrs[i]     = tree.radius_search(all_pts.data() + i*d, eps);
+        nbrs[i]      = tree.radius_search(all_pts.data() + i*d, eps);
         is_core_v[i] = (static_cast<int>(nbrs[i].size()) >= min_pts);
     }
 
-    // -------------------------------------------------------------------
-    // DSDBSCAN loop (Algorithm 5, lines 4-16):
-    //   iterate ONLY over X_t (local points)
-    // -------------------------------------------------------------------
     UnionFind uf(static_cast<int>(total_N));
     std::vector<bool> in_cluster_v(total_N, false);
 
     for (int64_t i = 0; i < local_N; ++i) {
         if (!is_core_v[i]) continue;
         in_cluster_v[i] = true;
-
         for (int j : nbrs[i]) {
             if (static_cast<int64_t>(j) == i) continue;
-
             if (static_cast<int64_t>(j) < local_N) {
-                // y ∈ N (local) — merge immediately
                 if (is_core_v[j]) {
                     uf.unite(static_cast<int>(i), j);
                     in_cluster_v[j] = true;
@@ -176,22 +328,18 @@ static LocalResult local_computation(
                     uf.unite(static_cast<int>(i), j);
                 }
             } else {
-                // y' ∈ N' (remote) — defer as UnionQuery
                 res.deferred.push_back(all_gids[i]);
                 res.deferred.push_back(all_gids[j]);
             }
         }
     }
 
-    // Assign labels using global-index root
-    for (int64_t i = 0; i < local_N; ++i) {
+    for (int64_t i = 0; i < local_N; ++i)
         if (in_cluster_v[i]) {
             int root = uf.find(static_cast<int>(i));
             res.labels[i] = all_gids[root];
         }
-    }
 
-    // Export per-point metadata for local points (for Stage 3)
     res.is_core.resize(local_N);
     res.in_cluster.resize(local_N);
     for (int64_t i = 0; i < local_N; ++i) {
@@ -204,9 +352,8 @@ static LocalResult local_computation(
 }
 
 // ---------------------------------------------------------------------------
-// Stage 3: Global Merge  (Algorithm 5, lines 17-28, simplified)
+// Stage 4: Global Merge of the boundary set  — UNCHANGED logic
 // ---------------------------------------------------------------------------
-// Returns: flat [old_root, canonical_root, ...] — only valid on rank 0.
 static std::vector<int64_t> global_merge(
     const std::vector<int64_t>& deferred,
     const std::vector<int64_t>& local_gids,
@@ -216,10 +363,8 @@ static std::vector<int64_t> global_merge(
     int64_t local_N,
     int rank, int size, MPI_Comm comm)
 {
-    // --- Gather deferred pairs ---
     std::vector<int64_t> all_deferred = gather_i64(deferred, rank, size, comm);
 
-    // --- Gather per-point metadata: [gid, is_core, in_cluster, label] × local_N ---
     std::vector<int64_t> meta_local;
     meta_local.reserve(static_cast<size_t>(local_N) * 4);
     for (int64_t i = 0; i < local_N; ++i) {
@@ -230,25 +375,17 @@ static std::vector<int64_t> global_merge(
     }
     std::vector<int64_t> all_meta = gather_i64(meta_local, rank, size, comm);
 
-    // --- Rank 0: run global sparse Union-Find ---
     std::vector<int64_t> flat_remap;
     if (rank == 0) {
-        // Parse metadata: gid → {is_core, in_cluster, cluster-root label}
         struct Meta { bool is_core; bool in_cluster; int64_t label; };
         std::unordered_map<int64_t, Meta> meta_map;
         meta_map.reserve(all_meta.size() / 4 + 1);
         for (size_t i = 0; i < all_meta.size(); i += 4) {
             int64_t gid = all_meta[i];
-            if (!meta_map.count(gid)) {   // first entry wins (local > remote)
+            if (!meta_map.count(gid))
                 meta_map[gid] = { all_meta[i+1] != 0, all_meta[i+2] != 0, all_meta[i+3] };
-            }
         }
 
-        // Global union-find operates on CLUSTER-ROOT LABELS, not raw point ids
-        // (a cluster's root is rarely a boundary point). A cross-partition edge
-        // (x core, y') merges two clusters ONLY when BOTH endpoints are core —
-        // border points never merge clusters in DBSCAN. x is always a core point
-        // by construction (deferred pairs are emitted only from core points).
         GlobalUF guf;
         for (size_t i = 0; i < all_deferred.size(); i += 2) {
             int64_t x_gid  = all_deferred[i];
@@ -256,16 +393,14 @@ static std::vector<int64_t> global_merge(
             auto itx = meta_map.find(x_gid);
             auto ity = meta_map.find(yp_gid);
             if (itx == meta_map.end() || ity == meta_map.end()) continue;
-            int64_t Lx = itx->second.label;          // x core ⇒ Lx ≥ 0
+            int64_t Lx = itx->second.label;
             if (Lx < 0) continue;
             if (ity->second.is_core) {
                 int64_t Ly = ity->second.label;
-                if (Ly >= 0) guf.unite(Lx, Ly);      // both core → merge clusters
+                if (Ly >= 0) guf.unite(Lx, Ly);
             }
-            // else: y' is a border point — it does not merge clusters.
         }
 
-        // Build flat remap over distinct cluster-root labels: [label, canonical].
         std::unordered_set<int64_t> seen;
         for (auto& kv : meta_map) {
             int64_t L = kv.second.label;
@@ -276,14 +411,12 @@ static std::vector<int64_t> global_merge(
         }
     }
 
-    // --- Bcast remap size, then data ---
     int64_t remap_sz = static_cast<int64_t>(flat_remap.size());
     MPI_Bcast(&remap_sz, 1, MPI_INT64_T, 0, comm);
     if (rank != 0) flat_remap.resize(static_cast<size_t>(remap_sz));
     if (remap_sz > 0)
         MPI_Bcast(flat_remap.data(), static_cast<int>(remap_sz),
                   MPI_INT64_T, 0, comm);
-
     return flat_remap;
 }
 
@@ -300,76 +433,97 @@ ParResult pdsdbscan_d(const std::vector<double>& pts,
     MPI_Comm_size(comm, &size);
 
     double t_wall_start = MPI_Wtime();
-    double t_comm  = 0.0;
-    double t_comp  = 0.0;
+    double t_comm = 0.0, t_comp = 0.0, tc;
 
     // ----------------------------------------------------------------
-    // Phase 0: Sort on rank 0, Bcast full dataset
+    // Phase 0: broadcast meta, then Scatterv disjoint chunks (no Bcast!)
     // ----------------------------------------------------------------
     int64_t N_global = N;
     MPI_Bcast(&N_global, 1, MPI_INT64_T, 0, comm);
     MPI_Bcast(&d,        1, MPI_INT,     0, comm);
 
-    // inv_order: only rank 0 needs this for final restoration
-    std::vector<int64_t> inv_order;
-
-    std::vector<double> all_pts(static_cast<size_t>(N_global) * d);
-    if (rank == 0) {
-        // Sort input by first coordinate (x-axis → 1-D block partition)
-        std::vector<int64_t> order(N_global);
-        std::iota(order.begin(), order.end(), 0LL);
-        std::sort(order.begin(), order.end(), [&](int64_t a, int64_t b) {
-            return pts[a*d] < pts[b*d];
-        });
-        for (int64_t i = 0; i < N_global; ++i)
-            for (int k = 0; k < d; ++k)
-                all_pts[i*d+k] = pts[order[i]*d+k];
-
-        inv_order.resize(N_global);
-        for (int64_t i = 0; i < N_global; ++i) inv_order[order[i]] = i;
-    }
-
-    double tc = MPI_Wtime();
-    MPI_Bcast(all_pts.data(), static_cast<int>(N_global * d), MPI_DOUBLE, 0, comm);
-    t_comm += MPI_Wtime() - tc;
-
-    // 1-D block partition
     int64_t start, end;
     block_range(N_global, rank, size, start, end);
-    int64_t local_N = end - start;
+    int64_t local_N0 = end - start;
 
-    std::vector<double>  local_pts(static_cast<size_t>(local_N) * d);
-    std::vector<int64_t> local_gids(local_N);
-    for (int64_t i = 0; i < local_N; ++i) {
-        std::copy(all_pts.begin() + (start+i)*d,
-                  all_pts.begin() + (start+i+1)*d,
-                  local_pts.begin() + i*d);
-        local_gids[i] = start + i;
+    std::vector<double>  local_pts(static_cast<size_t>(local_N0) * d);
+    std::vector<int64_t> local_oid(local_N0);
+    for (int64_t i = 0; i < local_N0; ++i) local_oid[i] = start + i;
+
+    // Scatterv coordinates from rank 0
+    std::vector<int> sc_cnt(size), sc_dis(size);
+    for (int r = 0; r < size; ++r) {
+        int64_t s, e; block_range(N_global, r, size, s, e);
+        sc_cnt[r] = static_cast<int>((e - s) * d);
+        sc_dis[r] = static_cast<int>(s * d);
     }
+    tc = MPI_Wtime();
+    MPI_Scatterv(rank == 0 ? pts.data() : nullptr,
+                 sc_cnt.data(), sc_dis.data(), MPI_DOUBLE,
+                 local_pts.data(), static_cast<int>(local_N0 * d), MPI_DOUBLE,
+                 0, comm);
+    t_comm += MPI_Wtime() - tc;
 
     // ----------------------------------------------------------------
-    // Stage 1: Gather-Neighbors
+    // Phase 1: geometric median partition (tree topology) — power-of-2 only
+    // ----------------------------------------------------------------
+    if (is_pow2(size) && size > 1) {
+        tc = MPI_Wtime();
+        geometric_partition(local_pts, local_oid, d, comm);
+        t_comm += MPI_Wtime() - tc;
+    } else if (size > 1) {
+        // Fallback for non-power-of-two: globally x-sort then Scatterv compact
+        // slabs so regions stay compact (correct either way; halo handles it).
+        std::vector<double>  sorted;
+        std::vector<int64_t> order_oid;
+        if (rank == 0) {
+            std::vector<int64_t> order(N_global);
+            std::iota(order.begin(), order.end(), 0LL);
+            std::sort(order.begin(), order.end(),
+                      [&](int64_t a, int64_t b){ return pts[a*d] < pts[b*d]; });
+            sorted.resize(static_cast<size_t>(N_global) * d);
+            order_oid.resize(N_global);
+            for (int64_t i = 0; i < N_global; ++i) {
+                order_oid[i] = order[i];
+                for (int k = 0; k < d; ++k) sorted[i*d+k] = pts[order[i]*d+k];
+            }
+        }
+        tc = MPI_Wtime();
+        MPI_Scatterv(rank == 0 ? sorted.data() : nullptr,
+                     sc_cnt.data(), sc_dis.data(), MPI_DOUBLE,
+                     local_pts.data(), static_cast<int>(local_N0 * d), MPI_DOUBLE,
+                     0, comm);
+        // ship the matching oids too
+        std::vector<int> oc(size), od(size);
+        for (int r = 0; r < size; ++r) { int64_t s,e; block_range(N_global,r,size,s,e);
+            oc[r] = static_cast<int>(e - s); od[r] = static_cast<int>(s); }
+        MPI_Scatterv(rank == 0 ? order_oid.data() : nullptr,
+                     oc.data(), od.data(), MPI_INT64_T,
+                     local_oid.data(), static_cast<int>(local_N0), MPI_INT64_T,
+                     0, comm);
+        t_comm += MPI_Wtime() - tc;
+    }
+
+    int64_t local_N = static_cast<int64_t>(local_oid.size());
+
+    // ----------------------------------------------------------------
+    // Phase 2: distributed halo (extra points)
     // ----------------------------------------------------------------
     std::vector<double>  remote_pts;
     std::vector<int64_t> remote_gids;
+    if (size > 1) {
+        tc = MPI_Wtime();
+        get_extra_points(local_pts, local_oid, d, eps, comm, remote_pts, remote_gids);
+        t_comm += MPI_Wtime() - tc;
+    }
 
-    // Allgather was done implicitly via Bcast above — filter locally.
-    // Time the filtering as "comm" (it uses the Bcast-ed buffer).
-    tc = MPI_Wtime();
-    gather_neighbors(all_pts, N_global, d,
-                     local_pts, local_N, start, end, eps,
-                     remote_pts, remote_gids);
-    // (filtering is O(N_global) memory reads — treated as communication overhead)
-    t_comm += MPI_Wtime() - tc;
-
-    // Build combined (local ∪ remote) point set for local computation
+    // Combined (local ∪ remote) set for local computation
     int64_t n_remote = static_cast<int64_t>(remote_gids.size());
     int64_t total_N  = local_N + n_remote;
-
     std::vector<double>  all_local_pts(static_cast<size_t>(total_N) * d);
     std::vector<int64_t> all_local_gids(total_N);
     std::copy(local_pts.begin(),  local_pts.end(),  all_local_pts.begin());
-    std::copy(local_gids.begin(), local_gids.end(), all_local_gids.begin());
+    std::copy(local_oid.begin(),  local_oid.end(),  all_local_gids.begin());
     if (n_remote > 0) {
         std::copy(remote_pts.begin(),  remote_pts.end(),
                   all_local_pts.begin()  + local_N * d);
@@ -378,36 +532,32 @@ ParResult pdsdbscan_d(const std::vector<double>& pts,
     }
 
     // ----------------------------------------------------------------
-    // Stage 2: Local Computation  (zero communication)
+    // Stage 3: Local Computation
     // ----------------------------------------------------------------
     LocalResult lr = local_computation(all_local_pts, all_local_gids,
                                        local_N, d, eps, min_pts);
     t_comp = lr.t_compute;
 
     // ----------------------------------------------------------------
-    // Stage 3: Global Merge
+    // Stage 4: Merge boundary set on rank 0
     // ----------------------------------------------------------------
     tc = MPI_Wtime();
     std::vector<int64_t> flat_remap = global_merge(
-        lr.deferred,
-        local_gids, lr.is_core, lr.in_cluster, lr.labels,
+        lr.deferred, local_oid, lr.is_core, lr.in_cluster, lr.labels,
         local_N, rank, size, comm);
     t_comm += MPI_Wtime() - tc;
 
-    // Parse remap into a hash map for O(1) lookup
     std::unordered_map<int64_t, int64_t> remap;
     remap.reserve(flat_remap.size() / 2 + 1);
     for (size_t i = 0; i < flat_remap.size(); i += 2)
         remap[flat_remap[i]] = flat_remap[i+1];
-
-    // Apply remapping to local labels (follow chain until stable)
     auto apply_remap = [&](int64_t lbl) -> int64_t {
         if (lbl < 0) return -1;
         int64_t root = lbl;
-        for (int iter = 0; iter < 100; ++iter) {
-            auto it = remap.find(root);
-            if (it == remap.end() || it->second == root) break;
-            root = it->second;
+        for (int it = 0; it < 100; ++it) {
+            auto f = remap.find(root);
+            if (f == remap.end() || f->second == root) break;
+            root = f->second;
         }
         return root;
     };
@@ -415,28 +565,23 @@ ParResult pdsdbscan_d(const std::vector<double>& pts,
         lr.labels[i] = apply_remap(lr.labels[i]);
 
     // ----------------------------------------------------------------
-    // Phase 4: Gather labels to rank 0
+    // Phase 5: Gather (orig_id, label) to rank 0
     // ----------------------------------------------------------------
-    // Pack as [gid0, lbl0, gid1, lbl1, ...]
     std::vector<int64_t> flat_labels;
     flat_labels.reserve(static_cast<size_t>(local_N) * 2);
     for (int64_t i = 0; i < local_N; ++i) {
-        flat_labels.push_back(local_gids[i]);
+        flat_labels.push_back(local_oid[i]);
         flat_labels.push_back(lr.labels[i]);
     }
-
     tc = MPI_Wtime();
     std::vector<int64_t> all_labels = gather_i64(flat_labels, rank, size, comm);
     t_comm += MPI_Wtime() - tc;
 
-    // ----------------------------------------------------------------
-    // Gather per-rank timing
-    // ----------------------------------------------------------------
+    // Per-rank timing
     std::array<double,2> my_times = {t_comp, t_comm};
     std::vector<double> all_times(static_cast<size_t>(size) * 2);
     MPI_Gather(my_times.data(), 2, MPI_DOUBLE,
-               rank == 0 ? all_times.data() : nullptr, 2, MPI_DOUBLE,
-               0, comm);
+               rank == 0 ? all_times.data() : nullptr, 2, MPI_DOUBLE, 0, comm);
 
     ParResult result;
     if (rank != 0) {
@@ -444,40 +589,24 @@ ParResult pdsdbscan_d(const std::vector<double>& pts,
         return result;
     }
 
-    // --- Assemble labels in sorted order, then restore original order ---
-    std::vector<int64_t> labels_sorted(N_global, -1);
-    for (size_t i = 0; i < all_labels.size(); i += 2) {
-        int64_t gid = all_labels[i];
-        int64_t lbl = all_labels[i+1];
-        labels_sorted[gid] = lbl;
-    }
+    // Reconstruct labels in original order (each point carries its orig id)
+    std::vector<int64_t> labels_orig(N_global, -1);
+    for (size_t i = 0; i < all_labels.size(); i += 2)
+        labels_orig[all_labels[i]] = all_labels[i+1];
 
-    // labels_sorted is indexed by sorted position; inv_order[i] gives the
-    // sorted position of the point whose ORIGINAL index is i.
-    std::vector<int64_t> labels_orig(N_global);
-    for (int64_t i = 0; i < N_global; ++i)
-        labels_orig[i] = labels_sorted[inv_order[i]];
-
-    // Compact to 0-based cluster IDs
     std::unordered_map<int64_t, int64_t> compact;
-    for (int64_t i = 0; i < N_global; ++i) {
+    for (int64_t i = 0; i < N_global; ++i)
         if (labels_orig[i] >= 0 && !compact.count(labels_orig[i])) {
             int64_t new_id = static_cast<int64_t>(compact.size());
             compact[labels_orig[i]] = new_id;
         }
-    }
-    for (int64_t i = 0; i < N_global; ++i) {
-        if (labels_orig[i] >= 0)
-            labels_orig[i] = compact[labels_orig[i]];
-    }
+    for (int64_t i = 0; i < N_global; ++i)
+        if (labels_orig[i] >= 0) labels_orig[i] = compact[labels_orig[i]];
 
-    // Build per-rank timing
     result.per_rank.resize(size);
     double max_comp = 0, max_comm = 0;
     for (int r = 0; r < size; ++r) {
-        result.per_rank[r] = { static_cast<double>(r),
-                               all_times[r*2],
-                               all_times[r*2+1] };
+        result.per_rank[r] = { static_cast<double>(r), all_times[r*2], all_times[r*2+1] };
         max_comp = std::max(max_comp, all_times[r*2]);
         max_comm = std::max(max_comm, all_times[r*2+1]);
     }
